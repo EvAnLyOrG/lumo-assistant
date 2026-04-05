@@ -36,7 +36,7 @@
 
 bash
 
-`git clone https://github.com/EvAnLyOrG/lumo-assistant.git`
+`git clone https://github.com/EvAnLyOrG/lumo-assistant.git`<br>
 `cd lumo-assistant`
 `npm install`
 `npm run compile`
