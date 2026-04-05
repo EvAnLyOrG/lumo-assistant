@@ -147,7 +147,7 @@ Your Session ID is stored locally in VS Code's secure settings and never transmi
 
 ## 📄 License
 
-This project is licensed under the MIT License — see the [license.txt](LICENSE) file for details.
+This project is licensed under the MIT License — see the [license](license.txt) file for details.
 
 ---
 
