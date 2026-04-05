@@ -67,7 +67,7 @@ Press F5 in VS Code to launch the extension in development mode.
 
 ### Chat Interface
 
-1. Click the **Lumo icon** (💜) in the Activity Bar (left sidebar).
+1. Click the **Lumo icon** in the Activity Bar (left sidebar).
 2. Type your message and press **Enter** or click **Send**.
 3. Your conversation history is automatically saved and restored.
 
