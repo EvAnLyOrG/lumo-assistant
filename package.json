@@ -2,7 +2,7 @@
   "name": "lumo-assistant",
   "displayName": "Lumo AI Assistant",
   "description": "Your secure AI companion, now in your vscode",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "evanly",
   "icon": "media/lumo-icon.png",
   "repository": {
@@ -49,6 +49,11 @@
         "command": "lumo.suggest",
         "title": "Lumo: Suggest Code",
         "category": "Lumo"
+      },
+      {
+            "command": "lumo.readFile",
+            "title": "Lumo: Read File to Chat",
+            "category": "Lumo"
       }
     ],
     "keybindings": [
@@ -103,6 +108,13 @@
                 "command": "lumo.suggest",
                 "group": "navigation",
                 "when": "editorTextFocus"
+            }
+        ],
+        "explorer/context": [
+            {
+                "command": "lumo.readFile",
+                "group": "navigation",
+                "when": "explorerResourceIsFolder == false"
             }
         ]
     }

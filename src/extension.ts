@@ -41,6 +41,51 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    public async injectMessage(text: string) {
+        // Treat this as a user message
+        this.messages.push({ role: 'user', content: text });
+        await this.saveChatHistory();
+        
+        // Trigger the response logic
+        this._view?.webview.postMessage({ command: 'thinking', state: true });
+
+        try {
+            const config = vscode.workspace.getConfiguration('lumo');
+            const sessionId = config.get<string>('sessionId');
+            const useCookieFallback = !sessionId;
+
+            let accessToken = '';
+            if (useCookieFallback) {
+                accessToken = 'dummy-for-cookie-mode';
+            } else {
+                try {
+                    const session = await vscode.authentication.getSession('lumo-auth', ['lumo'], { silent: true });
+                    if (session) accessToken = session.accessToken;
+                } catch { /* Fallback */ }
+            }
+
+            const workspaceContext = await this.getWorkspaceContext();
+            const response = await this.apiClient.chat(
+                this.messages,
+                accessToken,
+                workspaceContext,
+                useCookieFallback
+            );
+
+            this.messages.push({ role: 'assistant', content: response });
+            await this.saveChatHistory();
+            
+            this._view?.webview.postMessage({ command: 'response', text: response });
+        } catch (error: any) {
+            this._view?.webview.postMessage({ 
+                command: 'error', 
+                text: `Alas, something went wrong: ${error.message}` 
+            });
+        } finally {
+            this._view?.webview.postMessage({ command: 'thinking', state: false });
+        }
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         _context: vscode.WebviewViewResolveContext,
@@ -674,6 +719,47 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     context.subscriptions.push(signInCommand, signOutCommand);
+
+    // ... existing code ...
+
+    // Register the "Read File" Command
+    const readFileCommand = vscode.commands.registerCommand('lumo.readFile', async (uri) => {
+        if (!uri) {
+            // If triggered from command palette, ask user to pick a file
+            const files = await vscode.window.showOpenDialog({
+                canSelectFiles: true,
+                canSelectFolders: false,
+                canSelectMany: false,
+                openLabel: 'Select File'
+            });
+            if (!files || files.length === 0) return;
+            uri = files[0];
+        }
+
+        try {
+            const content = await vscode.workspace.fs.readFile(uri);
+            const textContent = Buffer.from(content).toString('utf-8');
+            
+            // Get the relative path for context
+            const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+            const relativePath = workspaceFolder 
+                ? path.relative(workspaceFolder.uri.fsPath, uri.fsPath) 
+                : uri.fsPath;
+
+            // Send to Lumo
+            const prompt = `Here is the content of the file: $${relativePath}\n\n\`\`\`$${path.extname(uri.fsPath).substring(1)}\n${textContent}\n\`\`\``;
+            
+            // Inject into the chat
+            if (viewProvider) {
+                viewProvider.injectMessage(prompt); // We need to add this method
+            } else {
+                vscode.window.showErrorMessage('Lumo chat is not active.');
+            }
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Failed to read file: ${error.message}`);
+        }
+    });
+    context.subscriptions.push(readFileCommand);
 
     console.log('✨ Lumo extension fully initialized!');
 }
