@@ -25,7 +25,7 @@
 
 ### From VSIX File (Recommended for Personal Use)
 
-1. Download the `lumo-assistant-0.1.0.vsix` file.
+1. Download the `lumo-assistant-0.3.0.vsix` file.
 2. Open VS Code.
 3. Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac).
 4. Type **"Extensions: Install from VSIX..."** and select it.
@@ -143,7 +143,7 @@ Your Session ID is stored locally in VS Code's secure settings and never transmi
 
 ## 📄 License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [license.txt](LICENSE) file for details.
 
 ---
 
