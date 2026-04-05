@@ -25,7 +25,11 @@
 
 ### From VSIX File (Recommended for Personal Use)
 
+<<<<<<< HEAD
 1. Download the `lumo-assistant-0.3.0.vsix` file.
+=======
+1. Download the `lumo-assistant-0.2.0.vsix` file.
+>>>>>>> eb386f9 (Update README.md)
 2. Open VS Code.
 3. Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac).
 4. Type **"Extensions: Install from VSIX..."** and select it.
