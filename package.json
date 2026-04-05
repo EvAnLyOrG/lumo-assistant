@@ -1,0 +1,123 @@
+{
+  "name": "lumo-assistant",
+  "displayName": "Lumo AI Assistant",
+  "description": "Your secure AI companion, now in your vscode",
+  "version": "0.4.0",
+  "publisher": "evanly",
+  "icon": "media/lumo-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EvAnLyOrG/lumo-assistant"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": ["onCommand:lumo.openPanel"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "authentication": [
+      {
+        "id": "lumo-auth",
+        "label": "Lumo"
+      }
+    ],
+    "commands": [
+      {
+        "command": "lumo.signIn",
+        "title": "Sign in to Lumo",
+        "category": "Lumo"
+      },
+      {
+        "command": "lumo.signOut",
+        "title": "Sign out from Lumo",
+        "category": "Lumo"
+      },
+      {
+        "command": "lumo.openPanel",
+        "title": "Open Lumo Chat",
+        "category": "Lumo"
+      },
+      {
+        "command": "lumo.sendSelection",
+        "title": "Send Selection to Lumo",
+        "category": "Lumo"
+      },
+      {
+        "command": "lumo.suggest",
+        "title": "Lumo: Suggest Code",
+        "category": "Lumo"
+      }
+    ],
+    "keybindings": [
+        {
+            "command": "lumo.suggest",
+            "key": "alt+/",
+            "mac": "alt+/",
+            "when": "editorTextFocus"
+        }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lumo-sidebar",
+          "title": "Lumo",
+          "icon": "media/lumo-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "lumo-sidebar": [
+        {
+          "type": "webview",
+          "id": "lumo.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Lumo",
+      "properties": {
+        "lumo.clientId": {
+          "type": "string",
+          "default": "",
+          "description": "Your Lumo OAuth Client ID (leave empty to use Session ID fallback)"
+        },
+        "lumo.sessionId": {
+          "type": "string",
+          "default": "",
+          "description": "Your Lumo Session-Id cookie (used if Client ID is not set)"
+        },
+        "lumo.apiEndpoint": {
+          "type": "string",
+          "default": "https://lumo.proton.me/api/ai/v1/chat",
+          "description": "Lumo API endpoint URL"
+        }
+      }
+    },
+    "menus": {
+        "editor/context": [
+            {
+                "command": "lumo.suggest",
+                "group": "navigation",
+                "when": "editorTextFocus"
+            }
+        ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "keytar": "^7.9.0"
+  }
+}

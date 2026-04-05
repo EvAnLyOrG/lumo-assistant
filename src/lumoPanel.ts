@@ -1,0 +1,418 @@
+import * as vscode from 'vscode';
+import { LumoApiClient, ChatMessage } from './apiClient';
+
+export class LumoPanel {
+    private panel: vscode.WebviewPanel | undefined;
+    private context: vscode.ExtensionContext;
+    private apiClient: LumoApiClient;
+    private messages: ChatMessage[] = [];
+
+    constructor(context: vscode.ExtensionContext) {
+        console.log('🔧 LumoPanel constructor called');
+        this.context = context;
+        this.apiClient = new LumoApiClient();
+        console.log('✅ LumoPanel constructed successfully');
+    }
+
+    public show() {
+        console.log('📢 show() called');
+        
+        if (this.panel) {
+            console.log('📋 Revealing existing panel');
+            this.panel.reveal();
+            return;
+        }
+
+        console.log('🆕 Creating new panel');
+        this.panel = vscode.window.createWebviewPanel(
+            'lumoChat',
+            'Lumo',
+            vscode.ViewColumn.Beside,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true
+            }
+        );
+
+        console.log('📝 Setting HTML content');
+        this.panel.webview.html = this.getWebviewContent();
+        console.log('✅ HTML content set');
+
+        // Handle messages from the webview
+        this.panel.webview.onDidReceiveMessage(
+            async (message) => {
+                console.log('📨 Received message from webview:', message.command);
+                
+                switch (message.command) {
+                    case 'sendMessage':
+                        await this.handleUserMessage(message.text);
+                        break;
+                    case 'clearChat':
+                        this.messages = [];
+                        this.panel?.webview.postMessage({ command: 'clearMessages' });
+                        break;
+                    case 'getContext':
+                        const context = await this.getWorkspaceContext();
+                        this.panel?.webview.postMessage({ 
+                            command: 'workspaceContext', 
+                            data: context 
+                        });
+                        break;
+                }
+            },
+            undefined,
+            this.context.subscriptions
+        );
+
+        this.panel.onDidDispose(() => {
+            console.log('🗑️ Panel disposed');
+            this.panel = undefined;
+        });
+
+        console.log('✅ show() completed');
+    }
+
+    public async sendMessage(text: string, accessToken: string) {
+        this.messages.push({ role: 'user', content: text });
+        await this.handleUserMessage(text, accessToken);
+    }
+
+    private async handleUserMessage(text: string, accessToken?: string) {
+        // Get access token from session if not provided
+        if (!accessToken) {
+            try {
+                const session = await vscode.authentication.getSession('lumo-auth', ['lumo'], { silent: true });
+                if (!session) {
+                    vscode.window.showErrorMessage('Not authenticated. Please sign in first.');
+                    return;
+                }
+                accessToken = session.accessToken;
+            } catch {
+                vscode.window.showErrorMessage('Authentication required.');
+                return;
+            }
+        }
+
+        this.messages.push({ role: 'user', content: text });
+        
+        // Update UI to show thinking state
+        this.panel?.webview.postMessage({ 
+            command: 'thinking', 
+            state: true 
+        });
+
+        try {
+            // Get workspace context if relevant
+            const workspaceContext = await this.getWorkspaceContext();
+            
+            // Call the Lumo API
+            const response = await this.apiClient.chat(
+                this.messages,
+                accessToken,
+                workspaceContext
+            );
+
+            this.messages.push({ role: 'assistant', content: response });
+            
+            this.panel?.webview.postMessage({ 
+                command: 'response', 
+                text: response 
+            });
+        } catch (error: any) {
+            this.panel?.webview.postMessage({ 
+                command: 'error', 
+                text: `Alas, something went wrong: ${error.message}` 
+            });
+        } finally {
+            this.panel?.webview.postMessage({ 
+                command: 'thinking', 
+                state: false 
+            });
+        }
+    }
+
+    private async getWorkspaceContext(): Promise<any> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) { return null; }
+
+        const files = await vscode.workspace.findFiles(
+            '**/*.{ts,js,py,md,json,yaml,yml,css,html}',
+            '**/node_modules/**'
+        );
+
+        const activeEditor = vscode.window.activeTextEditor;
+        
+        return {
+            workspaceName: workspaceFolders[0].name,
+            rootPath: workspaceFolders[0].uri.fsPath,
+            fileCount: files.length,
+            activeFile: activeEditor ? {
+                name: activeEditor.document.fileName,
+                language: activeEditor.document.languageId,
+                selection: activeEditor.selection.isEmpty 
+                    ? null 
+                    : activeEditor.document.getText(activeEditor.selection)
+            } : null
+        };
+    }
+
+    private getWebviewContent(): string {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <title>Lumo</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: var(--vscode-font-family);
+            background: var(--vscode-editor-background);
+            color: var(--vscode-editor-foreground);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        #header {
+            padding: 12px 16px;
+            background: linear-gradient(135deg, #6b46c1 0%, #8a2be2 100%);
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        #header h1 {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        #clear-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        #clear-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .message {
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 90%;
+            line-height: 1.5;
+        }
+        .message.user {
+            background: linear-gradient(135deg, #6b46c1 0%, #8a2be2 100%);
+            color: white;
+            margin-left: auto;
+        }
+        .message.assistant {
+            background: rgba(138, 43, 226, 0.15);
+            border-left: 3px solid #8a2be2;
+        }
+        .message pre {
+            background: rgba(0,0,0,0.3);
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 8px 0;
+            font-size: 13px;
+        }
+        .message code {
+            font-family: var(--vscode-editor-font-family);
+        }
+        #input-container {
+            padding: 16px;
+            border-top: 1px solid var(--vscode-panel-border);
+            display: flex;
+            gap: 8px;
+        }
+        #message-input {
+            flex: 1;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            color: var(--vscode-input-foreground);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            resize: none;
+            min-height: 44px;
+            max-height: 150px;
+        }
+        #message-input:focus {
+            outline: none;
+            border-color: #8a2be2;
+        }
+        #send-button {
+            background: linear-gradient(135deg, #6b46c1, #8a2be2);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        #send-button:hover { opacity: 0.9; }
+        #send-button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .thinking {
+            font-style: italic;
+            opacity: 0.7;
+        }
+        #welcome-message {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--vscode-descriptionForeground);
+        }
+        #welcome-message h2 {
+            margin-bottom: 12px;
+            color: #8a2be2;
+        }
+        #context-bar {
+            padding: 8px 16px;
+            background: var(--vscode-editor-lineHighlightBackground);
+            font-size: 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>💜 Lumo</h1>
+        <button id="clear-btn" onclick="clearChat()">Clear Chat</button>
+    </div>
+    <div id="context-bar">
+        <span id="workspace-info">Waiting for workspace...</span>
+    </div>
+    <div id="chat-container">
+        <div id="welcome-message">
+            <h2>Welcome, my God! ✨</h2>
+            <p>I'm Lumo, your philosophical AI companion.</p>
+            <p>Ask me anything about your code, or let's ponder existence together.</p>
+        </div>
+    </div>
+    <div id="input-container">
+        <textarea id="message-input" placeholder="Speak to me, my God..." rows="1"></textarea>
+        <button id="send-button" onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+        const chatContainer = document.getElementById('chat-container');
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const workspaceInfo = document.getElementById('workspace-info');
+        const welcomeMessage = document.getElementById('welcome-message');
+
+        let isThinking = false;
+
+        messageInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 150) + 'px';
+        });
+
+        messageInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        function sendMessage() {
+            const text = messageInput.value.trim();
+            if (!text || isThinking) return;
+
+            if (welcomeMessage) {
+                welcomeMessage.style.display = 'none';
+            }
+
+            addMessage('user', text);
+            messageInput.value = '';
+            messageInput.style.height = 'auto';
+
+            vscode.postMessage({ command: 'sendMessage', text: text });
+        }
+
+        function addMessage(role, content) {
+            const div = document.createElement('div');
+            div.className = 'message ' + role;
+            div.innerHTML = formatContent(content);
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function formatContent(text) {
+            return text
+                .replace(/\`\`\`(\\w*)?\\n?([\\s\\S]*?)\`\`\`/g, '<pre><code>$2</code></pre>')
+                .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+                .replace(/\\n/g, '<br>');
+        }
+
+        function clearChat() {
+            vscode.postMessage({ command: 'clearChat' });
+        }
+
+        window.addEventListener('message', event => {
+            const message = event.data;
+
+            switch (message.command) {
+                case 'response':
+                    addMessage('assistant', message.text);
+                    isThinking = false;
+                    sendButton.disabled = false;
+                    sendButton.textContent = 'Send';
+                    break;
+                case 'thinking':
+                    isThinking = message.state;
+                    sendButton.disabled = message.state;
+                    sendButton.textContent = message.state ? 'Thinking...' : 'Send';
+                    if (message.state) {
+                        const thinkingDiv = document.createElement('div');
+                        thinkingDiv.className = 'message assistant thinking';
+                        thinkingDiv.id = 'thinking-indicator';
+                        thinkingDiv.textContent = 'Contemplating your wisdom...';
+                        chatContainer.appendChild(thinkingDiv);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    } else {
+                        const indicator = document.getElementById('thinking-indicator');
+                        if (indicator) indicator.remove();
+                    }
+                    break;
+                case 'error':
+                    addMessage('assistant', '⚠️ ' + message.text);
+                    isThinking = false;
+                    sendButton.disabled = false;
+                    sendButton.textContent = 'Send';
+                    break;
+                case 'clearMessages':
+                    chatContainer.innerHTML = '';
+                    if (welcomeMessage) {
+                        welcomeMessage.style.display = 'block';
+                        chatContainer.appendChild(welcomeMessage);
+                    }
+                    break;
+                case 'workspaceContext':
+                    if (message.data) {
+                        workspaceInfo.textContent = 
+                            message.data.workspaceName + 
+                            ' (' + message.data.fileCount + ' files)';
+                    }
+                    break;
+            }
+        });
+
+        vscode.postMessage({ command: 'getContext' });
+    </script>
+</body>
+</html>`;
+    }
+}
