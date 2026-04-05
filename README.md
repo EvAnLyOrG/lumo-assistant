@@ -34,7 +34,7 @@
 
 ### From Source
 
-```bash
+bash
 git clone https://github.com/EvAnLyOrG/lumo-assistant.git
 cd lumo-assistant
 npm install
