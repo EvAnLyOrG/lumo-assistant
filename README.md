@@ -35,10 +35,10 @@
 ### From Source
 
 bash
-``git clone https://github.com/EvAnLyOrG/lumo-assistant.git
+`git clone https://github.com/EvAnLyOrG/lumo-assistant.git
 cd lumo-assistant
 npm install
-npm run compile``
+npm run compile`
 
 Press F5 in VS Code to launch the extension in development mode.
 
