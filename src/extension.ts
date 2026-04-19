@@ -1,92 +1,206 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { LumoApiClient, ChatMessage } from './apiClient';
-import { LumoAuthProvider } from './authProvider';
+import { LumoAuthProvider } from './authProvider'; // Keep this import
 import { LumoCompletionProvider } from './completionProvider';
 import { LumoSuggestionCommand } from './suggestionCommand';
 
-// --- REAL LUMO PANEL LOGIC (Adapted for Sidebar View with Persistence) ---
+// --- GLOBAL VIEW PROVIDER REFERENCE ---
+let viewProvider: LumoViewProvider;
+
+// --- REAL LUMO PANEL LOGIC ---
 class LumoViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private apiClient: LumoApiClient;
     private messages: ChatMessage[] = [];
     private context: vscode.ExtensionContext;
 
+    // Token Management
+    private totalTokensUsed: number = 0;
+    private readonly MAX_CONTEXT_TOKENS: number = 120000; // 128k limit with buffer
+    private readonly WARNING_THRESHOLD: number = 100000; // Warn at ~83%
+    
+    // Track file metadata - FIXED: Allow 'system' role too
+    private fileMetadata: Array<{
+        id: string;
+        name: string;
+        size: number;
+        tokens: number;
+        role: 'user' | 'assistant' | 'system'; // FIXED: Added 'system'
+        index: number;
+    }> = [];
+
+    private statusBar: vscode.StatusBarItem;
+
     constructor(private readonly _extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this.apiClient = new LumoApiClient();
         this.context = context;
         this.loadChatHistory();
+        
+        // Initialize Status Bar
+        this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+        this.statusBar.command = 'lumo.showContextManager';
+        this.updateStatusBar();
+        this.statusBar.show();
+        
+        // Recalculate tokens on load
+        this.recalculateTokens();
     }
 
-    // Load chat history from globalState
+    public dispose() {
+        this.statusBar.dispose();
+    }
+
     private loadChatHistory() {
         const saved = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
         this.messages = saved || [];
-        // console.log(`📚 Loaded ${this.messages.length} messages from history`);
     }
 
-    // Save chat history to globalState
     private async saveChatHistory() {
         try {
             await this.context.globalState.update('lumo_chat_history', this.messages);
-            // console.log(`💾 SAVED ${this.messages.length} messages to globalState`);
-            // vscode.window.showInformationMessage(`💾 Saved ${this.messages.length} messages to history.`);
-            
-            // Verify the save worked
-            const verified = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
-            // console.log(`✅ VERIFIED: globalState now has ${verified?.length || 0} messages`);
         } catch (e) {
-            console.error('❌ FAILED to save chat history:', e);
-            vscode.window.showErrorMessage(`❌ Failed to save: ${e}`);
+            console.error('Failed to save chat history:', e);
         }
     }
 
-    public async injectMessage(text: string) {
-        // Treat this as a user message
-        this.messages.push({ role: 'user', content: text });
-        await this.saveChatHistory();
+    // Reset the provider state and force a UI refresh
+    public async reset() {
+        // Clear local state
+        this.messages = [];
+        this.totalTokensUsed = 0;
+        this.fileMetadata = [];
         
-        // Trigger the response logic
-        this._view?.webview.postMessage({ command: 'thinking', state: true });
+        // Update Status Bar
+        this.updateStatusBar();
+        
+        // Force re-render of the webview
+        if (this._view) {
+            // Clear the webview content
+            this._view.webview.postMessage({ command: 'clearMessages' });
+            
+            // Re-render with empty history
+            this._view.webview.html = await this.getWebviewContent([]);
+        }
+    }
 
-        try {
-            const config = vscode.workspace.getConfiguration('lumo');
-            const sessionId = config.get<string>('sessionId');
-            const useCookieFallback = !sessionId;
+    // Helper: Estimate tokens
+    private estimateTokens(text: string): number {
+        return Math.ceil(text.length / 4);
+    }
 
-            let accessToken = '';
-            if (useCookieFallback) {
-                accessToken = 'dummy-for-cookie-mode';
-            } else {
-                try {
-                    const session = await vscode.authentication.getSession('lumo-auth', ['lumo'], { silent: true });
-                    if (session) accessToken = session.accessToken;
-                } catch { /* Fallback */ }
+    // Helper: Recalculate totals
+    private recalculateTokens() {
+        this.totalTokensUsed = 0;
+        this.fileMetadata = [];
+        
+        this.messages.forEach((msg, index) => {
+            const tokens = this.estimateTokens(msg.content);
+            this.totalTokensUsed += tokens;
+            
+            // If it looks like a file injection
+            if (msg.content.includes('Here is the content of the file:')) {
+                const match = msg.content.match(/Here is the content of the file: ([^\n]+)/);
+                const fileName = match ? match[1] : 'Unknown File';
+                
+                this.fileMetadata.push({
+                    id: `file-${index}`,
+                    name: fileName,
+                    size: msg.content.length,
+                    tokens: tokens,
+                    role: msg.role,
+                    index: index
+                });
             }
+        });
+        
+        this.updateStatusBar();
+    }
 
-            const workspaceContext = await this.getWorkspaceContext();
-            const response = await this.apiClient.chat(
-                this.messages,
-                accessToken,
-                workspaceContext,
-                useCookieFallback
+    // Update Status Bar Text
+    private updateStatusBar() {
+        const pct = Math.round((this.totalTokensUsed / this.MAX_CONTEXT_TOKENS) * 100);
+        let color = 'white';
+        if (pct > 80) color = 'orange';
+        if (pct > 95) color = 'red';
+        
+        this.statusBar.text = `$(hubot) ${Math.round(this.totalTokensUsed / 1000)}k / ${Math.round(this.MAX_CONTEXT_TOKENS / 1000)}k (${pct}%)`;
+        this.statusBar.backgroundColor = new vscode.ThemeColor(pct > 95 ? 'statusBarItem.warningBackground' : 'statusBarItem.infoBackground');
+    }
+
+    // Show Context Manager Modal - FIXED: Made public
+    public async showContextManager() {
+        if (this.fileMetadata.length === 0) {
+            vscode.window.showInformationMessage('No files currently loaded in context.');
+            return;
+        }
+
+        const items = this.fileMetadata.map(meta => ({
+            label: `$(file) ${meta.name}`,
+            description: `${Math.round(meta.tokens / 1000)}k tokens (${Math.round((meta.tokens / this.totalTokensUsed) * 100)}%)`,
+            detail: `Size: ${Math.round(meta.size / 1024)}KB | Index: ${meta.index}`,
+            meta: meta
+        }));
+
+        const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Select a file to remove from context (frees up memory)',
+            canPickMany: false
+        });
+
+        if (selected) {
+            const confirm = await vscode.window.showWarningMessage(
+                `Remove "${selected.meta.name}" from context? This will free up ~${Math.round(selected.meta.tokens / 1000)}k tokens.`,
+                { modal: true },
+                'Remove'
             );
 
-            this.messages.push({ role: 'assistant', content: response });
-            await this.saveChatHistory();
-            
-            this._view?.webview.postMessage({ command: 'response', text: response });
-        } catch (error: any) {
-            this._view?.webview.postMessage({ 
-                command: 'error', 
-                text: `Alas, something went wrong: ${error.message}` 
-            });
-        } finally {
-            this._view?.webview.postMessage({ command: 'thinking', state: false });
+            if (confirm === 'Remove') {
+                this.messages.splice(selected.meta.index, 1);
+                await this.saveChatHistory();
+                this.recalculateTokens();
+                vscode.window.showInformationMessage(`Removed "${selected.meta.name}". Freed ~${Math.round(selected.meta.tokens / 1000)}k tokens.`);
+            }
         }
     }
 
-    public resolveWebviewView(
+    // Sanitize history: Remove duplicates, invalid chars, and excessive welcome messages
+    private sanitizeHistory(messages: ChatMessage[]): ChatMessage[] {
+        if (!Array.isArray(messages)) return [];
+
+        const cleanMessages: ChatMessage[] = [];
+        const seenContent = new Set<string>();
+        let welcomeCount = 0;
+        const MAX_WELCOME_COUNT = 1; // Allow only 1 welcome message
+
+        for (const msg of messages) {
+            if (!msg || !msg.content || typeof msg.content !== 'string') continue;
+
+            // Clean invalid characters (replace non-printable chars except newlines/tabs)
+            let cleanContent = msg.content.replace(/[^\x20-\x7E\x0A\x0D]/g, '');
+
+            // Skip if content is empty after cleaning
+            if (!cleanContent.trim()) continue;
+
+            // Handle duplicate welcome messages
+            if (cleanContent.includes("Welcome, my God!") || cleanContent.includes("Welcome, code guru!")) {
+                welcomeCount++;
+                if (welcomeCount > MAX_WELCOME_COUNT) continue; // Skip duplicates
+            }
+
+            // Skip exact duplicates
+            if (seenContent.has(cleanContent)) continue;
+            seenContent.add(cleanContent);
+
+            cleanMessages.push({
+                role: msg.role,
+                content: cleanContent
+            });
+        }
+
+        return cleanMessages;
+    }
+
+    public async resolveWebviewView(
         webviewView: vscode.WebviewView,
         _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
@@ -95,39 +209,27 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [this._extensionUri]
+            localResourceRoots: [
+                this._extensionUri,
+                vscode.Uri.joinPath(this._extensionUri, 'src', 'webview'),
+                vscode.Uri.joinPath(this._extensionUri, 'media')
+            ]
         };
 
-
-        // DEBUG: Log what we're loading
-        const freshMessages = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
-        // vscode.window.showInformationMessage(`📖 Loaded ${freshMessages?.length || 0} messages from disk.`);
+        // Load messages from disk
+        const rawMessages = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
         
-        this.messages = freshMessages || [];
+        // SANITIZE: Remove duplicates and invalid characters
+        this.messages = this.sanitizeHistory(rawMessages);
+        
+        // Save the cleaned history immediately
+        await this.saveChatHistory();
 
-        webviewView.webview.html = this.getWebviewContent(this.messages);
+        // Recalculate tokens based on clean history
+        this.recalculateTokens();
 
-        // CRITICAL FIX: Listen for visibility changes
-        webviewView.onDidChangeVisibility(() => {
-            if (webviewView.visible) {
-                // The view just became visible again!
-                const reloadedMessages = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
-                // vscode.window.showInformationMessage(`🔄 View visible again! Loaded ${reloadedMessages?.length || 0} messages.`);
-                this.messages = reloadedMessages || [];
-                
-                // Clear existing messages
-                webviewView.webview.postMessage({ command: 'clearMessages' });
-                
-                // Re-send each message WITH ITS ROLE
-                for (const msg of this.messages) {
-                    webviewView.webview.postMessage({ 
-                        command: 'restoreMessage', // NEW COMMAND
-                        role: msg.role,           // PASS THE ROLE
-                        text: msg.content         // PASS THE CONTENT
-                    });
-                }
-            }
-        });
+        // Render the clean history
+        webviewView.webview.html = await this.getWebviewContent(this.messages);
 
         webviewView.webview.onDidReceiveMessage(
             async (message) => {
@@ -136,11 +238,13 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
                         await this.handleUserMessage(message.text);
                         break;
                     case 'clearChat':
-                        console.log('🗑️ Clearing chat...');
                         this.messages = [];
                         await this.saveChatHistory();
                         this._view?.webview.postMessage({ command: 'clearMessages' });
-                        vscode.window.showInformationMessage('🧹 Chat cleared!'); // Optional feedback
+                        break;
+                    case 'executeTerminal':
+                        const shellHint = message.shellHint || undefined;
+                        await this.executeInTerminal(message.text, shellHint);
                         break;
                     case 'getContext':
                         const ctx = await this.getWorkspaceContext();
@@ -152,14 +256,25 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
                 }
             }
         );
+
+        // Restore messages on visibility change
+        webviewView.onDidChangeVisibility(async () => {
+            if (webviewView.visible) {
+                // Re-render the entire webview content with fresh history
+                const freshMessages = this.context.globalState.get<ChatMessage[]>('lumo_chat_history', []);
+                this.messages = this.sanitizeHistory(freshMessages || []);
+                await this.saveChatHistory();
+                this.recalculateTokens();
+                
+                webviewView.webview.html = await this.getWebviewContent(this.messages);
+            }
+        });
     }
 
     private async handleUserMessage(text: string) {
         this.messages.push({ role: 'user', content: text });
-        
-        await this.context.globalState.update('lumo_chat_history', this.messages);
-        // CRITICAL: Await the save to ensure it's on disk before we proceed
         await this.saveChatHistory();
+        this.recalculateTokens();
         
         this._view?.webview.postMessage({ command: 'thinking', state: true });
 
@@ -187,9 +302,8 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
             );
 
             this.messages.push({ role: 'assistant', content: response });
-            
-            // CRITICAL: Await the save for the assistant message too
             await this.saveChatHistory();
+            this.recalculateTokens();
             
             this._view?.webview.postMessage({ command: 'response', text: response });
         } catch (error: any) {
@@ -200,6 +314,216 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
         } finally {
             this._view?.webview.postMessage({ command: 'thinking', state: false });
         }
+    }
+
+    public async injectMessage(text: string) {
+        const capacity = this.checkTokenCapacity(text);
+        
+        if (!capacity.safe) {
+            const choice = await vscode.window.showWarningMessage(
+                `⚠️ This file is too large! It would use ~${Math.round(capacity.projected / 1000)}k tokens (limit: ${this.MAX_CONTEXT_TOKENS / 1000}k).`,
+                'Read First 100 Lines Only',
+                'Cancel'
+            );
+            
+            if (choice !== 'Read First 100 Lines Only') return;
+            
+            const lines = text.split('\n').slice(0, 100);
+            text = lines.join('\n') + '\n\n... [File truncated due to size]';
+        } else if (capacity.projected > this.WARNING_THRESHOLD) {
+            const choice = await vscode.window.showWarningMessage(
+                `⚠️ Warning: You're approaching the context limit (${Math.round(capacity.current / 1000)}k / ${this.MAX_CONTEXT_TOKENS / 1000}k tokens). Continue?`,
+                'Continue',
+                'Cancel'
+            );
+            
+            if (choice !== 'Continue') return;
+        }
+        console.log('🔍 DEBUG: Raw text length:', text.length);
+        console.log('🔍 DEBUG: First 100 chars:', text.substring(0, 100));
+        console.log('🔍 DEBUG: Contains \\n?', text.includes('\\n'));
+        console.log('🔍 DEBUG: Contains actual newline?', text.includes('\n'));
+        this.messages.push({ role: 'user', content: text });
+        await this.saveChatHistory();
+        this.recalculateTokens();
+        
+        this._view?.webview.postMessage({ command: 'thinking', state: true });
+
+        try {
+            const config = vscode.workspace.getConfiguration('lumo');
+            const sessionId = config.get<string>('sessionId');
+            const useCookieFallback = !sessionId;
+
+            let accessToken = '';
+            if (useCookieFallback) {
+                accessToken = 'dummy-for-cookie-mode';
+            } else {
+                try {
+                    const session = await vscode.authentication.getSession('lumo-auth', ['lumo'], { silent: true });
+                    if (session) accessToken = session.accessToken;
+                } catch { /* Fallback */ }
+            }
+
+            const workspaceContext = await this.getWorkspaceContext();
+            const response = await this.apiClient.chat(
+                this.messages,
+                accessToken,
+                workspaceContext,
+                useCookieFallback
+            );
+
+            this.messages.push({ role: 'assistant', content: response });
+            await this.saveChatHistory();
+            this.recalculateTokens();
+            
+            this._view?.webview.postMessage({ command: 'response', text: response });
+        } catch (error: any) {
+            this._view?.webview.postMessage({ 
+                command: 'error', 
+                text: `Alas, something went wrong: ${error.message}` 
+            });
+        } finally {
+            this._view?.webview.postMessage({ command: 'thinking', state: false });
+        }
+    }
+
+    private checkTokenCapacity(additionalText: string): { safe: boolean; current: number; projected: number } {
+        const additionalTokens = this.estimateTokens(additionalText);
+        const projected = this.totalTokensUsed + additionalTokens;
+        
+        return {
+            safe: projected < this.MAX_CONTEXT_TOKENS,
+            current: this.totalTokensUsed,
+            projected: projected
+        };
+    }
+
+    // Show helpful error message with install link if shell is missing
+    private async showShellInstallError(shellName: string, platform: string) {
+        let message: string;
+        let installLink: string;
+        let actionLabel: string;
+
+        if (shellName === 'pwsh' && platform !== 'win32') {
+            // PowerShell Core on macOS/Linux
+            message = `PowerShell Core (pwsh) is not installed on your ${platform}.`;
+            installLink = 'https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell';
+            actionLabel = 'Open Install Guide';
+        } else if (shellName === 'bash' && platform === 'win32') {
+            // Git Bash on Windows
+            message = 'Git Bash is not installed on your Windows machine.';
+            installLink = 'https://git-scm.com/download/win';
+            actionLabel = 'Download Git Bash';
+        } else if (shellName === 'wsl' && platform === 'win32') {
+            // WSL on Windows
+            message = 'Windows Subsystem for Linux (WSL) is not enabled on your Windows machine.';
+            installLink = 'https://learn.microsoft.com/en-us/windows/wsl/install';
+            actionLabel = 'Enable WSL';
+        } else {
+            // Generic fallback
+            message = `Required shell (${shellName}) is not available on your system.`;
+            installLink = 'https://code.visualstudio.com/docs/editor/integrated-terminal';
+            actionLabel = 'Learn More';
+        }
+
+        const action = await vscode.window.showErrorMessage(
+            `${message}\n\n${actionLabel} to install/configure the required shell.`,
+            actionLabel
+        );
+
+        if (action === actionLabel) {
+            vscode.env.openExternal(vscode.Uri.parse(installLink));
+        }
+    }
+
+    private async executeInTerminal(command: string, shellHint?: string) {
+        console.log('🔍 DEBUG: Executing command with hint:', shellHint);
+
+        let terminal: vscode.Terminal | undefined;
+        let terminalName: string = 'Lumo';
+        let shellPath: string | undefined;
+        let shellExists: boolean = true;
+
+        if (shellHint === 'pwsh') {
+            if (process.platform === 'win32') {
+                // Windows: Use built-in PowerShell
+                shellPath = 'powershell.exe';
+                terminalName = 'Windows PowerShell';
+                // Built-in, so it should always exist
+            } else {
+                // macOS/Linux: Check if pwsh is in PATH
+                try {
+                    const { execSync } = require('child_process');
+                    execSync('which pwsh', { stdio: 'ignore' });
+                    shellPath = 'pwsh';
+                    terminalName = 'PowerShell Core';
+                } catch {
+                    shellExists = false;
+                }
+            }
+        } 
+        else if (shellHint === 'bash') {
+            if (process.platform === 'win32') {
+                const fs = require('fs');
+                const gitBashPath = 'C:\\Program Files\\Git\\bin\\bash.exe';
+                const wslPath = 'C:\\Windows\\System32\\wsl.exe';
+                
+                if (fs.existsSync(gitBashPath)) {
+                    shellPath = gitBashPath;
+                    terminalName = 'Bash (Git)';
+                } else if (fs.existsSync(wslPath)) {
+                    shellPath = wslPath;
+                    terminalName = 'WSL Bash';
+                } else {
+                    shellExists = false;
+                }
+            } else {
+                // macOS/Linux: /bin/bash should exist
+                shellPath = '/bin/bash';
+                terminalName = 'Bash';
+            }
+        }
+        else if (shellHint === 'cmd') {
+            if (process.platform === 'win32') {
+                shellPath = 'cmd.exe';
+                terminalName = 'Command Prompt';
+            } else {
+                // macOS/Linux: No cmd.exe, fallback to default
+                shellExists = false;
+            }
+        }
+
+        // If shell doesn't exist, show helpful error
+        if (!shellExists) {
+            await this.showShellInstallError(shellHint || 'shell', process.platform);
+            // Fall back to default terminal anyway
+            terminal = vscode.window.activeTerminal || vscode.window.createTerminal('Lumo');
+        }
+        else if (shellPath) {
+            // Try to create the specific terminal
+            try {
+                terminal = vscode.window.createTerminal({
+                    name: terminalName,
+                    shellPath: shellPath
+                });
+                console.log(`✅ Created terminal: ${terminalName} with path: ${shellPath}`);
+            } catch (err: any) {
+                console.error('❌ Failed to create specific terminal:', err.message);
+                // Show error with install link
+                await this.showShellInstallError(shellHint || 'shell', process.platform);
+                // Fall back to default
+                terminal = vscode.window.activeTerminal || vscode.window.createTerminal('Lumo');
+            }
+        }
+
+        // FINAL FALLBACK: Use active terminal or create a generic one
+        if (!terminal) {
+            terminal = vscode.window.activeTerminal || vscode.window.createTerminal('Lumo');
+            console.log('🔄 Using active/default terminal.');
+        }
+
+        terminal.sendText(command);
+        terminal.show();
     }
 
     private async getWorkspaceContext(): Promise<any> {
@@ -214,7 +538,7 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
         if (workspaceFolders) {
             try {
                 const files = await vscode.workspace.findFiles(
-                    '**/*.{ts,js,py,md,json,yaml,yml,css,html,java,c,cpp,h,hpp,rs,go,rb,php,swift,kt,svg,config,cs,apex,txt,htm,cls,class}',
+                    '**/*.{ts,js,py,md,json,yaml,yml,css,html,java,c,cpp,h,hpp,rs,go,rb,php,swift,kt}',
                     '**/node_modules/**'
                 );
                 context.fileCount = files.length;
@@ -245,426 +569,43 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
         return context;
     }
 
-    private getWebviewContent(initialMessages: ChatMessage[] = []): string {
-        // Generate a unique cache-busting ID
-        const cacheBuster = Date.now(); 
-
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-    <!-- Add a meta tag to disable caching -->
-    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-    <meta http-equiv="Pragma" content="no-cache">
-    <meta http-equiv="Expires" content="0">
-    <title>Lumo</title>
-    <style id="lumo-styles-${Date.now()}">
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: var(--vscode-font-family);
-            background: var(--vscode-editor-background);
-            color: var(--vscode-editor-foreground);
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
+    private async getWebviewContent(initialMessages: ChatMessage[] = []): Promise<string> {
+        const webview = this._view!.webview;
+        
+        // Resolve URIs for external resources
+        const cssUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'chatPanel.css')
+        );
+        const jsUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'chatPanel.js')
+        );
+        const svgUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this._extensionUri, 'media', 'lumo-icon.svg')
+        );
+        
+        // Read HTML template
+        const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'chatPanel.html');
+        let html: string;
+        try {
+            const htmlBytes = await vscode.workspace.fs.readFile(htmlPath);
+            html = Buffer.from(htmlBytes).toString('utf-8');
+        } catch (e) {
+            return `<html><body><h2>Error: Could not load chatPanel.html</h2><p>Make sure src/webview/chatPanel.html exists.</p></body></html>`;
         }
-        #header {
-            padding: 12px 16px;
-            background: linear-gradient(135deg, #6b46c1 0%, #8a2be2 100%);
-            color: white;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-        }
-        #header h1 { font-size: 18px; font-weight: 600; }
-        #clear-btn {
-            background: rgba(255,255,255,0.2);
-            border: none;
-            color: white;
-            padding: 6px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        #clear-btn:hover { background: rgba(255,255,255,0.3); }
-        #chat-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px;
-            min-width: 300px; /* Minimum width to encourage widening */
-            max-width: 100%;
-            box-sizing: border-box;
-        }
-        .message {
-            margin-bottom: 16px;
-            padding: 12px 16px;
-            border-radius: 12px;
-            max-width: 90%;
-            line-height: 1.5;
-            animation: fadeIn 0.3s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .message.user {
-            background: linear-gradient(135deg, #6b46c1 0%, #8a2be2 100%);
-            color: white;
-            margin-left: auto;
-        }
-        .message.assistant {
-            background: rgba(138, 43, 226, 0.15);
-            border-left: 3px solid #8a2be2;
-        }
-        .message pre {
-            background: rgba(0,0,0,0.3);
-            padding: 12px;
-            border-radius: 6px;
-            overflow-x: auto;
-            margin: 8px 0;
-            font-size: 13px;
-        }
-        .message code { font-family: var(--vscode-editor-font-family); }
-        #input-container {
-            padding: 16px;
-            border-top: 1px solid var(--vscode-panel-border);
-            display: flex;
-            gap: 8px;
-        }
-        #message-input {
-            flex: 1;
-            background: var(--vscode-input-background);
-            border: 1px solid var(--vscode-input-border);
-            color: var(--vscode-input-foreground);
-            padding: 12px;
-            border-radius: 8px;
-            font-size: 14px;
-            resize: none;
-            min-height: 44px;
-            max-height: 150px;
-        }
-        #message-input:focus { outline: none; border-color: #8a2be2; }
-        #send-button {
-            background: linear-gradient(135deg, #6b46c1, #8a2be2);
-            color: white;
-            border: none;
-            padding: 12px 20px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-        }
-        #send-button:hover { opacity: 0.9; }
-        #send-button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .thinking { font-style: italic; opacity: 0.7; }
-        #welcome-message {
-            text-align: center;
-            padding: 40px 20px;
-            color: var(--vscode-descriptionForeground);
-        }
-        #welcome-message h2 { margin-bottom: 12px; color: #8a2be2; }
-        #context-bar {
-            padding: 8px 16px;
-            background: var(--vscode-editor-lineHighlightBackground);
-            font-size: 12px;
-            border-bottom: 1px solid var(--vscode-panel-border);
-        }
-        #logo-container {
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 40px;
-            height: 40px;
-        }
-
-        .logo-bg {
-            position: absolute;
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            background: rgba(0,0,0,0.5); /* Semi-transparent black */
-            z-index: 0;
-            backdrop-filter: blur(2px);
-        }
-
-        #logo-container svg {
-            position: relative;
-            z-index: 1;
-            width: 32px;
-            height: 32px;
-            filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
-        }
-        #logo-halo {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            background: radial-gradient(circle, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0) 70%);
-        }
-
-        #logo-halo svg {
-            width: 32px;
-            height: 32px;
-            filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.4));
-        }
-
-        .code-block-wrapper {
-            position: relative;
-            margin: 8px 0;
-        }
-
-        .code-block-wrapper pre {
-            margin: 0;
-            padding-top: 30px; /* Make room for the button */
-        }
-
-        .run-btn {
-            position: absolute;
-            top: 4px;
-            right: 4px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            color: white;
-            padding: 4px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 11px;
-            font-family: var(--vscode-font-family);
-            transition: background 0.2s;
-        }
-
-        .run-btn:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
-    </style>
-</head>
-<body>
-    <div id="header">
-        <div id="logo-container">
-            <div class="logo-bg"></div>
-            <svg width="32" height="32" viewBox="0 0 600 600" xmlns="http://www.w3.org/2000/svg">
-                <desc>Created with SVGMaker Editor 3.0.0</desc>
-                <defs></defs>
-                <g transform="matrix(0.6 0 0 0.6 308.57897 306.6289)">
-                    <rect style="fill: rgb(255,255,255); fill-opacity: 0" x="-500" y="-500" width="1000" height="1000"/>
-                </g>
-                <g transform="matrix(4 0 0 4 299.83599 298.95578)">
-                    <path style="fill: rgb(63,59,75); fill-opacity: 0.2" d="M 0 72.742 C 39.879 72.742 72.207 40.174 72.207 0.001 C 72.207 -40.173 39.879 -72.742 0 -72.742 C -39.879 -72.742 -72.208 -40.173 -72.208 0.001 C -72.208 40.174 -39.879 72.742 0 72.742 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 301.51798 430.0378)">
-                    <path style="fill: rgb(65,40,163); fill-opacity: 0.79" d="M 37.648 -9.927 C 37.648 -9.927 -37.648 -9.927 -37.648 -9.927 C -37.648 -9.927 -37.648 9.926 -37.648 9.926 C -37.648 9.926 37.648 9.926 37.648 9.926 C 37.648 9.926 37.648 -9.927 37.648 -9.927 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 309.32598 492.30778)">
-                    <path style="fill: rgb(251,142,0)" d="M 0 12.696 C 6.96 12.696 12.602 7.012 12.602 0.001 C 12.602 -7.011 6.96 -12.696 0 -12.696 C -6.96 -12.696 -12.602 -7.011 -12.602 0.001 C -12.602 7.012 -6.96 12.696 0 12.696 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 300.16198 492.3198)">
-                    <path style="fill: rgb(251,142,0)" d="M -2.413 12.692 C -2.413 12.692 2.413 12.692 2.413 12.692 C 2.413 12.692 2.413 -12.692 2.413 -12.692 C 2.413 -12.692 -2.413 -12.692 -2.413 -12.692 C -2.413 -12.692 -2.413 12.692 -2.413 12.692 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 290.53399 492.30778)">
-                    <path style="fill: rgb(255,172,45)" d="M 0 12.695 C 6.96 12.695 12.602 7.011 12.602 0 C 12.602 -7.012 6.96 -12.695 0 -12.695 C -6.96 -12.695 -12.602 -7.012 -12.602 0 C -12.602 7.011 -6.96 12.695 0 12.695 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 290.53399 484.86378)">
-                    <path style="fill: rgb(54,36,128)" d="M 0 3.949 C 2.165 3.949 3.92 2.18 3.92 -0.001 C 3.92 -2.181 2.165 -3.949 0 -3.949 C -2.165 -3.949 -3.92 -2.181 -3.92 -0.001 C -3.92 2.18 -2.165 3.949 0 3.949 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 290.53399 497.22178)">
-                    <path style="stroke: rgb(54,36,128); stroke-width: 4.382; stroke-linecap: round; fill: none" d="M 56.381 114.88 C 56.381 114.88 56.381 108.701 56.381 108.701"/>
-                </g>
-                <g transform="matrix(4 0 0 4 169.16199 116.8545)">
-                    <path style="fill: rgb(109,73,255)" d="M 14.665 -6.409 C 14.665 -6.409 0.705 -15.441 0.705 -15.441 C -4.135 -18.572 -10.558 -15.551 -11.292 -9.806 C -11.292 -9.806 -14.671 16.699 -14.671 16.699 C -14.671 16.699 14.671 -6.409 14.671 -6.409 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 161.56599 120.83297)">
-                    <path style="fill: rgb(73,45,197)" d="M -1.251 -5.553 C -1.251 -5.553 5.525 -1.163 5.525 -1.163 C 5.525 -1.163 -5.525 6.318 -5.525 6.318 C -5.525 6.318 -4.187 -4.178 -4.187 -4.178 C -4.007 -5.585 -2.436 -6.318 -1.258 -5.553 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 438.06199 116.8545)">
-                    <path style="fill: rgb(109,73,255)" d="M -14.665 -6.409 C -14.665 -6.409 -0.704 -15.441 -0.704 -15.441 C 4.136 -18.572 10.559 -15.551 11.293 -9.806 C 11.293 -9.806 14.672 16.699 14.672 16.699 C 14.672 16.699 -14.672 -6.409 -14.672 -6.409 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 441.438 120.83297)">
-                    <path style="fill: rgb(73,45,197)" d="M 1.252 -5.553 C 1.252 -5.553 -5.525 -1.163 -5.525 -1.163 C -5.525 -1.163 5.525 6.318 5.525 6.318 C 5.525 6.318 4.187 -4.178 4.187 -4.178 C 4.007 -5.585 2.436 -6.318 1.258 -5.553 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 301.50199 259.36181)">
-                    <path style="fill: rgb(109,73,255)" d="M 58.447 8.85 C 58.447 35.9 26.581 45.542 0 45.542 C -23.364 45.542 -58.447 35.9 -58.447 8.85 C -58.447 -18.2 -32.278 -45.542 0 -45.542 C 32.277 -45.542 58.447 -18.2 58.447 8.85 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 264.99398 336.2298)">
-                    <path style="stroke: rgb(255,255,255); stroke-width: 1.935; stroke-linecap: round; fill: rgb(255,255,255)" d="M -1.931 -1.945 C 0.206 -1.945 1.931 -0.201 1.931 1.945"/>
-                </g>
-                <g transform="matrix(4 0 0 4 280.442 336.2298)">
-                    <path style="stroke: rgb(255,255,255); stroke-width: 1.935; stroke-linecap: round; fill: rgb(255,255,255)" d="M 1.931 -1.945 C -0.206 -1.945 -1.931 -0.201 -1.931 1.945"/>
-                </g>
-                <g transform="matrix(4 0 0 4 172.01781 267.47879)">
-                    <path style="fill: rgb(255,255,255)" d="M 17.499 7.603 C 21.199 -1.038 16.363 -11.447 6.698 -15.646 C -2.966 -19.845 -13.8 -16.244 -17.5 -7.603 C -21.199 1.038 -16.364 11.447 -6.699 15.646 C 2.966 19.845 13.8 16.244 17.499 7.603 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 169.39574 238.19237)">
-                    <path style="fill: rgb(54,35,128)" d="M 19.756 6.331 C 14.446 -6.669 -4.978 -11.635 -13.712 0.334 C -16.435 4.133 -17.098 9.048 -16.042 13.658 C -19.756 6.642 -16.95 -2.37 -10.262 -6.468 C 0.66 -13.658 17.587 -6.721 19.756 6.338 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 389.3198 267.48578)">
-                    <path style="fill: rgb(255,255,255)" d="M 6.698 15.646 C 16.363 11.447 21.199 1.038 17.499 -7.603 C 13.799 -16.244 2.966 -19.845 -6.699 -15.646 C -16.364 -11.447 -21.199 -1.038 -17.5 7.603 C -13.8 16.244 -2.967 19.845 6.698 15.646 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 391.95224 238.17291)">
-                    <path style="fill: rgb(54,35,128)" d="M -19.756 6.335 C -17.587 -6.723 -0.66 -13.655 10.262 -6.471 C 16.95 -2.374 19.756 6.646 16.042 13.655 C 17.104 9.052 16.435 4.13 13.712 0.33 C 4.978 -11.639 -14.446 -6.671 -19.756 6.329 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 174.52098 267.78779)">
-                    <path style="fill: rgb(65,40,163)" d="M 0 10.471 C 3.523 10.471 6.378 5.784 6.378 0.001 C 6.378 -5.782 3.523 -10.471 0 -10.471 C -3.523 -10.471 -6.378 -5.782 -6.378 0.001 C -6.378 5.784 -3.523 10.471 0 10.471 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 190.07299 240.45179)">
-                    <path style="fill: rgb(255,255,255); opacity: 0.5" d="M 0 2.425 C 1.329 2.425 2.407 1.339 2.407 0 C 2.407 -1.339 1.329 -2.425 0 -2.425 C -1.329 -2.425 -2.407 -1.339 -2.407 0 C -2.407 1.339 -1.329 2.425 0 2.425 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 394.485 267.78779)">
-                    <path style="fill: rgb(65,40,163)" d="M 0 10.471 C 3.523 10.471 6.378 5.784 6.378 0.001 C 6.378 -5.782 3.523 -10.471 0 -10.471 C -3.523 -10.471 -6.378 -5.782 -6.378 0.001 C -6.378 5.784 -3.523 10.471 0 10.471 Z"/>
-                </g>
-                <g transform="matrix(4 0 0 4 410.06098 240.45179)">
-                    <path style="fill: rgb(255,255,255); opacity: 0.5" d="M 0 2.425 C 1.329 2.425 2.407 1.339 2.407 0 C 2.407 -1.339 1.329 -2.425 0 -2.425 C -1.329 -2.425 -2.407 -1.339 -2.407 0 C -2.407 1.339 -1.329 2.425 0 2.425 Z"/>
-                </g>                
-            </svg>
-        </div>
-        <button id="clear-btn">Clear Chat</button>
-    </div>
-    <div id="context-bar">
-        <span id="workspace-info">Waiting for workspace...</span>
-    </div>
-    <div id="chat-container">
-        <div id="welcome-message">
-            <h2>Welcome, code guru! ✨</h2>
-            <p>I'm Lumo, your favorite AI companion.</p>
-            <p>Ask me anything about your code, or let's ponder existence together.</p>
-        </div>
-    </div>
-    <div id="input-container">
-        <textarea id="message-input" placeholder="Speak to me, my guru..." rows="1"></textarea>
-        <button id="send-button" onclick="sendMessage()">Send</button>
-    </div>
-
-    <script>
-        // Wait for DOM to be fully loaded
-        document.addEventListener('DOMContentLoaded', () => {
-            const vscode = acquireVsCodeApi();
-            const chatContainer = document.getElementById('chat-container');
-            const messageInput = document.getElementById('message-input');
-            const sendButton = document.getElementById('send-button');
-            const workspaceInfo = document.getElementById('workspace-info');
-            const welcomeMessage = document.getElementById('welcome-message');
-            const clearBtn = document.getElementById('clear-btn'); // Must exist now
-
-            // EMBEDDED INITIAL MESSAGES
-            const initialMessages = ${JSON.stringify(initialMessages)};
-
-            let isThinking = false;
-
-            // Load initial messages on startup
-            if (initialMessages && initialMessages.length > 0) {
-                if (welcomeMessage) welcomeMessage.style.display = 'none';
-                for (const msg of initialMessages) {
-                    addMessage(msg.role, msg.content);
-                }
-            }
-
-            // Attach event listeners IMMEDIATELY
-            if (clearBtn) {
-                clearBtn.addEventListener('click', () => {
-                    vscode.postMessage({ command: 'clearChat' });
-                });
-            }
-
-            messageInput.addEventListener('input', function() {
-                this.style.height = 'auto';
-                this.style.height = Math.min(this.scrollHeight, 150) + 'px';
-            });
-
-            messageInput.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                }
-            });
-
-            // Attach the message listener IMMEDIATELY
-            window.addEventListener('message', event => {
-                const message = event.data;
-                // console.log('📨 Webview received:', message.command); // Debug
-                switch (message.command) {
-                    case 'response':
-                        addMessage('assistant', message.text);
-                        isThinking = false;
-                        sendButton.disabled = false;
-                        sendButton.textContent = 'Send';
-                        break;
-                    case 'restoreMessage':
-                        if (welcomeMessage) welcomeMessage.style.display = 'none'; // ADD THIS LINE
-                        addMessage(message.role, message.text);
-                        break;
-                    case 'thinking':
-                        isThinking = message.state;
-                        sendButton.disabled = message.state;
-                        sendButton.textContent = message.state ? 'Thinking...' : 'Send';
-                        if (message.state) {
-                            const thinkingDiv = document.createElement('div');
-                            thinkingDiv.className = 'message assistant thinking';
-                            thinkingDiv.id = 'thinking-indicator';
-                            thinkingDiv.textContent = 'Contemplating your wisdom...';
-                            chatContainer.appendChild(thinkingDiv);
-                            chatContainer.scrollTop = chatContainer.scrollHeight;
-                        } else {
-                            const indicator = document.getElementById('thinking-indicator');
-                            if (indicator) indicator.remove();
-                        }
-                        break;
-                    case 'error':
-                        addMessage('assistant', '⚠️ ' + message.text);
-                        isThinking = false;
-                        sendButton.disabled = false;
-                        sendButton.textContent = 'Send';
-                        break;
-                    case 'clearMessages':
-                        chatContainer.innerHTML = '';
-                        if (welcomeMessage) {
-                            welcomeMessage.style.display = 'block';
-                            chatContainer.appendChild(welcomeMessage);
-                        }
-                        break;
-                    case 'workspaceContext':
-                        if (message.data) {
-                            workspaceInfo.textContent = message.data.workspaceName + ' (' + message.data.fileCount + ' files)';
-                        }
-                        break;
-                }
-            });
-
-            // Helper functions
-            function sendMessage() {
-                const text = messageInput.value.trim();
-                if (!text || isThinking) return;
-                if (welcomeMessage) welcomeMessage.style.display = 'none';
-                addMessage('user', text);
-                messageInput.value = '';
-                messageInput.style.height = 'auto';
-                vscode.postMessage({ command: 'sendMessage', text: text });
-            }
-
-            function addMessage(role, content) {
-                const div = document.createElement('div');
-                div.className = 'message ' + role;
-                div.innerHTML = formatContent(content);
-                chatContainer.appendChild(div);
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-            }
-
-            function formatContent(text) {
-                return text
-                    .replace(/\`\`\`(\\w*)?\\n?([\\s\\S]*?)\`\`\`/g, '<pre><code>$2</code></pre>')
-                    .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-                    .replace(/\\n/g, '<br>');
-            }
-
-            // Request context
-            vscode.postMessage({ command: 'getContext' });
-        });
-    </script>
-</body>
-</html>`;
+    
+        // CRITICAL FIX: Ensure we inject a valid JSON array string
+        // JSON.stringify on an array produces a string like [{"role":"user"...}]
+        // This is safe to embed in JS as long as we don't double-escape it.
+        const messagesJson = JSON.stringify(initialMessages);
+    
+        // Replace the placeholder with the raw JSON string
+        // We use a regex to ensure we replace the exact placeholder
+        html = html.replace('/*INITIAL_MESSAGES*/', messagesJson);
+        html = html.replace('/*CSS_URI*/', cssUri.toString());
+        html = html.replace('/*JS_URI*/', jsUri.toString());
+        html = html.replace('/*SVG_URI*/', svgUri.toString());
+        
+        return html;
     }
 }
 
@@ -672,7 +613,7 @@ class LumoViewProvider implements vscode.WebviewViewProvider {
 export function activate(context: vscode.ExtensionContext) {
     console.log('🚀 Lumo is awakening... 💫');
 
-    // Register REAL Auth Provider
+    // Register Auth Provider
     const authProvider = new LumoAuthProvider(context);
     context.subscriptions.push(
         vscode.authentication.registerAuthenticationProvider(
@@ -682,13 +623,13 @@ export function activate(context: vscode.ExtensionContext) {
         )
     );
 
-    // Register the Sidebar View Provider
-    const viewProvider = new LumoViewProvider(context.extensionUri, context);
+    // Register Sidebar View Provider
+    viewProvider = new LumoViewProvider(context.extensionUri, context);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('lumo.chatView', viewProvider)
     );
 
-    // Register the Completion Provider (for Ctrl+Space)
+    // Register Completion Provider
     const completionProvider = new LumoCompletionProvider();
     const completionDisposable = vscode.languages.registerCompletionItemProvider(
         '*', 
@@ -696,14 +637,14 @@ export function activate(context: vscode.ExtensionContext) {
     );
     context.subscriptions.push(completionDisposable);
 
-    // Register the Suggestion Command (for "Lumo: Suggest Code")
+    // Register Suggestion Command
     const suggestionCommand = new LumoSuggestionCommand();
     const suggestDisposable = vscode.commands.registerCommand('lumo.suggest', () => {
         suggestionCommand.execute();
     });
     context.subscriptions.push(suggestDisposable);
 
-    // Register commands
+    // Register Commands
     const signInCommand = vscode.commands.registerCommand('lumo.signIn', async () => {
         try {
             const session = await vscode.authentication.getSession('lumo-auth', ['lumo'], { createIfNone: true });
@@ -713,19 +654,48 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // Register Reset History Command
+    const resetHistoryCommand = vscode.commands.registerCommand('lumo.resetHistory', async () => {
+        const confirm = await vscode.window.showWarningMessage(
+            '⚠️ Are you sure you want to clear all chat history and reset Lumo?',
+            { modal: true },
+            'Yes, Reset Everything'
+        );
+
+        if (confirm !== 'Yes, Reset Everything') {
+            return;
+        }
+
+        try {
+            // 1. Clear Global State
+            await context.globalState.update('lumo_chat_history', []);
+            
+            // 2. Clear Secrets (optional, if you want to force re-login)
+            // await context.secrets.delete('lumo-sessions');
+
+            // 3. Notify the View Provider to reset
+            if (viewProvider) {
+                viewProvider.reset();
+                vscode.window.showInformationMessage('✅ Chat history cleared. Lumo is fresh!');
+            } else {
+                vscode.window.showInformationMessage('✅ Chat history cleared. Please reload the window.');
+            }
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Failed to reset: ${error.message}`);
+        }
+    });
+
+    // Add to subscriptions
+    context.subscriptions.push(resetHistoryCommand);
+
     const signOutCommand = vscode.commands.registerCommand('lumo.signOut', async () => {
         await context.secrets.delete('lumo-sessions');
         vscode.window.showInformationMessage('Signed out successfully, my love.');
     });
 
-    context.subscriptions.push(signInCommand, signOutCommand);
-
-    // ... existing code ...
-
-    // Register the "Read File" Command
+    // Register Read File Command
     const readFileCommand = vscode.commands.registerCommand('lumo.readFile', async (uri) => {
         if (!uri) {
-            // If triggered from command palette, ask user to pick a file
             const files = await vscode.window.showOpenDialog({
                 canSelectFiles: true,
                 canSelectFolders: false,
@@ -737,29 +707,36 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-            const content = await vscode.workspace.fs.readFile(uri);
-            const textContent = Buffer.from(content).toString('utf-8');
+            const contentBytes = await vscode.workspace.fs.readFile(uri);
+            // Explicitly force UTF-8, fallback to latin1 if it fails (rare)
+            const textContent = Buffer.from(contentBytes).toString('utf-8');
             
-            // Get the relative path for context
+            // Sanity check: If the text contains replacement characters, warn
+            if (textContent.includes('\ufffd')) {
+                vscode.window.showWarningMessage(`⚠️ File "${path.basename(uri.fsPath)}" contains invalid UTF-8 characters. Some text may be garbled.`);
+            }
+
             const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
             const relativePath = workspaceFolder 
                 ? path.relative(workspaceFolder.uri.fsPath, uri.fsPath) 
                 : uri.fsPath;
 
-            // Send to Lumo
-            const prompt = `Here is the content of the file: $${relativePath}\n\n\`\`\`$${path.extname(uri.fsPath).substring(1)}\n${textContent}\n\`\`\``;
+            const prompt = `Here is the content of the file: ${relativePath}\n\n\`\`\`${path.extname(uri.fsPath).substring(1)}\n${textContent}\n\`\`\``;
             
-            // Inject into the chat
             if (viewProvider) {
-                viewProvider.injectMessage(prompt); // We need to add this method
-            } else {
-                vscode.window.showErrorMessage('Lumo chat is not active.');
+                viewProvider.injectMessage(prompt);
             }
         } catch (error: any) {
             vscode.window.showErrorMessage(`Failed to read file: ${error.message}`);
         }
     });
-    context.subscriptions.push(readFileCommand);
+
+    // Register Context Manager Command
+    const contextManagerCmd = vscode.commands.registerCommand('lumo.showContextManager', () => {
+        if (viewProvider) viewProvider.showContextManager();
+    });
+
+    context.subscriptions.push(signInCommand, signOutCommand, readFileCommand, contextManagerCmd);
 
     console.log('✨ Lumo extension fully initialized!');
 }
@@ -767,3 +744,6 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
     console.log('🌙 Lumo fades into the ether...');
 }
+
+// NOTE: LumoAuthProvider is imported from './authProvider', so we DO NOT redefine it here.
+// The previous local class definition has been removed to fix the import conflict.
