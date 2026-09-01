@@ -102,7 +102,7 @@
         },
         "lumo.apiEndpoint": {
           "type": "string",
-          "default": "https://lumo.proton.me/api/ai/v1/chat",
+          "default": "https://lumo.proton.me/api/ai/v1/chat/completions",
           "description": "Lumo API endpoint URL"
         }
       }

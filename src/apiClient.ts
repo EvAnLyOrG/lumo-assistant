@@ -9,7 +9,7 @@ export interface ChatMessage {
 }
 
 export class LumoApiClient {
-    private defaultEndpoint = 'https://lumo.proton.me/api/ai/v1/chat';
+    private defaultEndpoint = 'https://lumo.proton.me/api/ai/v1/chat/completions';
     // The Session-Id cookie you found
     // private sessionId = 'aBDCfKlnBlnADwSTIoELcAAAARY'; 
     // private sessionId = 'adGkSFa-UHuswc6nFvSrtQAAAMM';
@@ -79,29 +79,24 @@ export class LumoApiClient {
         workspaceContext?: any,
         useCookieFallback: boolean = false
     ): Promise<string> {
-        const endpoint = this.defaultEndpoint;
+        const config = vscode.workspace.getConfiguration('lumo');
+        const configuredEndpoint = config.get<string>('apiEndpoint');
+        const endpoint = (configuredEndpoint && configuredEndpoint.trim()) || this.defaultEndpoint;
         const systemPrompt = this.buildSystemPrompt(workspaceContext);
 
         const turns = [
-            { role: "system", content: systemPrompt, images: [] },
+            { role: "system", content: systemPrompt },
             ...messages.map(msg => ({
                 role: msg.role,
-                content: msg.content,
-                images: []
+                content: msg.content
             }))
         ];
 
+        // Current chat/completions endpoint expects an OpenAI-style body,
+        // not the legacy Prompt/turns/targets shape.
         const payload = {
-            Prompt: {
-                type: "generation_request",
-                turns: turns,
-                options: {
-                    tools: ["proton_info", "web_search", "weather", "stock", "cryptocurrency"]
-                }
-            },
-            targets: ["message", "title"],
-            request_key: crypto.randomUUID(),
-            request_id: crypto.randomUUID()
+            model: "lumo",
+            messages: turns
         };
 
         const data = JSON.stringify(payload);
@@ -113,8 +108,8 @@ export class LumoApiClient {
             const headers: any = {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(data),
-                'x-pm-appversion': 'web-lumo@1.3.3.0', // Revert to the working version!
-                'Accept': 'text/event-stream',
+                'x-pm-appversion': 'web-lumo@1.3.3.0',
+                'Accept': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             };
 
@@ -169,35 +164,16 @@ export class LumoApiClient {
 
                 res.on('end', () => {
                     try {
-                        const lines = fullResponse.split('\n');
-                        let content = '';
-                        
-                        for (const line of lines) {
-                            if (line.startsWith('data:')) {
-                                const jsonStr = line.substring(5).trim();
-                                if (jsonStr && jsonStr !== '[DONE]') {
-                                    try {
-                                        const json = JSON.parse(jsonStr);
-                                        
-                                        // CRITICAL FIX: Only process chunks where target is "message"
-                                        if (json.target === 'message' && json.content) {
-                                            content += json.content;
-                                        }
-                                        
-                                    } catch {
-                                        // Skip malformed JSON
-                                    }
-                                }
-                            }
-                        }
+                        const json = JSON.parse(fullResponse);
+                        const content = json?.choices?.[0]?.message?.content;
 
                         if (content) {
                             resolve(this.cleanResponse(content));
                         } else {
-                            reject(new Error('No message content received.'));
+                            reject(new Error('No message content received: ' + fullResponse));
                         }
                     } catch (e: any) {
-                        reject(new Error('Failed to parse response: ' + e.message));
+                        reject(new Error('Failed to parse response: ' + e.message + ' | raw: ' + fullResponse));
                     }
                 });
             });
